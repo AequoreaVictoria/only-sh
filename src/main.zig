@@ -1,6 +1,5 @@
 const std = @import("std");
 const c_heap = std.heap.c_allocator;
-const fmt = std.fmt;
 const mem = std.mem;
 const print = std.debug.warn;
 const process = std.process;
@@ -94,7 +93,7 @@ const ARGV = struct {
     const Self = @This();
 
     fn init(heap: *Allocator, arg: []const u8) !Self {
-        const input = fmt.trim(arg);
+        const input = mem.trim(u8, arg, &std.ascii.spaces);
         const args_count = try count(input);
         const size = try measure(heap, input, args_count);
         const bytes = @sizeOf(usize) * (args_count + 1); // +1 for the null terminator
