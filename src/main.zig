@@ -1,221 +1,208 @@
 const std = @import("std");
-const c_heap = std.heap.c_allocator;
 const mem = std.mem;
 const print = std.debug.warn;
-const process = std.process;
-const Allocator = mem.Allocator;
-const c = @cImport({
-    @cInclude("unistd.h");
-});
-
-// The shell filename must be at least one character followed by the '-only' tag
-const MIN_NAME = 6;
+const basename = std.fs.path.basename;
 
 pub fn main() !u8 {
-    const status = enum(u8) { OK, INPUT_ERROR, VALIDATION_ERROR };
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var arena_heap = &arena.allocator;
 
-    const in_argv = try process.argsAlloc(c_heap);
-    defer c_heap.free(in_argv);
+    const input_argv = std.os.argv;
+    const name = basename(input_argv[0][0 .. mem.len(input_argv[0])]);
 
-    if (!validFilename(in_argv[0])) {
-        print("your shell must be named like '<command>-only', e.g. rsync-only\n", .{});
-        return @enumToInt(status.INPUT_ERROR);
+    // name[] needs to fit the '<command>-only' naming convention
+    if (!mem.eql(u8, "-only", name[name.len - "-only".len ..])) {
+        print("wrong filename\n", .{});
+        return std.c.ENOTSUP;
     }
 
-    if (!validArgumentCount(in_argv)) {
+    // This shell will be called like 'sh -c "command arg1..argN"'
+    // cmd_pos holds the position of the string provided to '-c'
+    const cmd_pos = getCmdPos(input_argv) catch {
         print("wrong command\n", .{});
-        return @enumToInt(status.INPUT_ERROR);
-    }
+        return std.c.EINVAL;
+    };
 
-    // The command will always be the last value in in_argv[]
-    const out_argv = ARGV.init(c_heap, in_argv[in_argv.len - 1]) catch |err| {
+    // Returns a null-terminated ARGV array for use with execvpeZ_expandArg0()
+    const exec_argv = mkArgv(arena_heap, input_argv[cmd_pos]) catch |err| {
         if (err == error.QUOTATION_ERROR) {
             print("invalid quotation\n", .{});
-            return @enumToInt(status.INPUT_ERROR);
+            return std.c.EINVAL;
         } else return err;
     };
-    defer out_argv.free();
 
-    if (!try validCommand(c_heap, in_argv[0], out_argv.args[0].?, out_argv.size[0])) {
+    // The program names in name[] and exec_argv0[] must match
+    const exec_argv0 = basename(exec_argv[0].?[0 .. mem.len(exec_argv[0].?)]);
+    if (!mem.eql(u8, name[0 .. name.len - "-only".len], exec_argv0)) {
         print("wrong command\n", .{});
-        return @enumToInt(status.VALIDATION_ERROR);
+        return std.c.EACCES;
     }
 
-    const code = c.execvp(out_argv.args[0].?, out_argv.args);
-    if (code == -1) {
-        print("command failure\n", .{});
-        return @enumToInt(status.INPUT_ERROR);
-    } else return @enumToInt(status.OK);
-}
-
-// At minimum this shell will be called like 'sh -c "command arg1..argN"'
-fn validArgumentCount(argv: [][]u8) bool {
-    return !(argv.len < 3);
-}
-
-// The shell filename must be MIN_NAME long and end in '-only'
-fn validFilename(arg: []const u8) bool {
-    if ((arg.len < MIN_NAME) or (!mem.eql(u8, "-only", arg[(arg.len - 5)..arg.len]))) return false;
-    return true;
-}
-
-// Compares the check[] command against the command extracted from arg0[]
-fn validCommand(heap: *Allocator, arg0: []const u8, check: [*:0]const u8, check_size: usize) !bool {
-    const arg0_size = arg0.len - MIN_NAME;
-
-    var arg0_idx: usize = arg0_size;
-    while (arg0_idx > 0) : (arg0_idx -= 1) if (arg0[arg0_idx] == '/') break;
-
-    const valid_size = arg0_size - arg0_idx;
-    if (check_size != valid_size) return false;
-
-    // Set position to after the / separator
-    arg0_idx += 1;
-    var valid = try heap.alloc(u8, valid_size);
-    defer heap.free(valid);
-    for (valid) |char, i| {
-        valid[i] = arg0[arg0_idx];
-        arg0_idx += 1;
+    var envp = @ptrCast([*:null]?[*:0]u8, std.os.environ.ptr);
+    const err = std.os.execvpeZ_expandArg0(.expand, exec_argv[0].?, exec_argv, envp);
+    switch (err) {
+        std.os.ExecveError.AccessDenied => {
+            print("access denied\n", .{});
+            return std.c.EACCES;
+        },
+        std.os.ExecveError.FileBusy => {
+            print("file busy\n", .{});
+            return std.c.EBUSY;
+        },
+        std.os.ExecveError.FileNotFound => {
+            print("file not found\n", .{});
+            return std.c.ENOENT;
+        },
+        std.os.ExecveError.FileSystem => {
+            print("file system error\n", .{});
+            return std.c.EIO;
+        },
+        std.os.ExecveError.InvalidExe => {
+            print("invalid executable\n", .{});
+            return std.c.ENOEXEC;
+        },
+        std.os.ExecveError.IsDir => {
+            print("file is directory\n", .{});
+            return std.c.EISDIR;
+        },
+        std.os.ExecveError.NameTooLong => {
+            print("name too long\n", .{});
+            return std.c.ENAMETOOLONG;
+        },
+        std.os.ExecveError.NotDir => {
+            print("file is not directory\n", .{});
+            return std.c.ENOTDIR;
+        },
+        std.os.ExecveError.ProcessFdQuotaExceeded => {
+            print("process fd quota exceeded\n", .{});
+            return std.c.EMFILE;
+        },
+        std.os.ExecveError.SystemFdQuotaExceeded => {
+            print("system fd quota exceeded\n", .{});
+            return std.c.ENFILE;
+        },
+        std.os.ExecveError.SystemResources => {
+            print("no available system resources\n", .{});
+            return std.c.ENOMEM;
+        },
+        std.os.ExecveError.Unexpected => {
+            print("unexpected error\n", .{});
+            return err;
+        },
     }
-
-    // Set position to before the 0 terminator
-    var check_idx = check_size - 1;
-    while (check_idx > 0) : (check_idx -= 1) if (check[check_idx] != valid[check_idx]) return false;
-
-    return true;
 }
 
-const ARGV = struct {
-    heap: *Allocator,
-    args: [*:null]?[*:0]u8,
-    size: []usize,
-    bytes: usize,
-    const Self = @This();
-
-    fn init(heap: *Allocator, arg: []const u8) !Self {
-        const input = mem.trim(u8, arg, &std.ascii.spaces);
-        const args_count = try count(input);
-        const size = try measure(heap, input, args_count);
-        const bytes = @sizeOf(usize) * (args_count + 1); // +1 for the null terminator
-        const buffer = try heap.alignedAlloc(u8, @alignOf(?*u8), bytes);
-
-        var args = mem.bytesAsSlice(?[*:0]u8, buffer);
-        for (size) |s, i| {
-            var string = try heap.alloc(u8, s + 1); // +1 for the 0 terminator
-            for (string) |char, ch| string[ch] = 0;
-            args[i] = @ptrCast(*[*:0]u8, &string).*;
+fn getCmdPos(argv: [][*:0]u8) !usize {
+    var pos: ?usize = null;
+    for (argv) |a, i| {
+        if (mem.eql(u8, "-c", a[0 .. mem.len(a)])) {
+            if (pos != null) return error.DUPLICATE_POS;
+            if (i + 1 >= argv.len) return error.OVERFLOW_POS;
+            pos = i + 1;
         }
-        args[args_count] = null;
-
-        var in_single_quotes = false;
-        var in_double_quotes = false;
-        var previously_space = false;
-        var string: usize = 0;
-        var char: usize = 0;
-        for (input) |ch| switch (ch) {
-            ' ' => {
-                if (in_single_quotes or in_double_quotes) {
-                    args[string].?[char] = ch;
-                    char += 1;
-                } else if (!previously_space) {
-                    previously_space = true;
-                    string += 1;
-                    char = 0;
-                }
-            },
-            '\'' => {
-                previously_space = false;
-                in_single_quotes = !in_single_quotes;
-            },
-            '"' => {
-                previously_space = false;
-                in_double_quotes = !in_double_quotes;
-            },
-            else => {
-                previously_space = false;
-                args[string].?[char] = ch;
-                char += 1;
-            },
-        };
-
-        return Self{
-            .heap = heap,
-            .args = @ptrCast(*[*:null]?[*:0]u8, &args).*,
-            .size = size,
-            .bytes = bytes,
-        };
     }
+    if (pos == null) return error.NULL_POS;
+    return pos.?;
+}
 
-    fn free(s: *const Self) void {
-        for (s.size) |size, i| {
-            const string = @ptrCast([*]u8, s.args[i]);
-            s.heap.free(string[0..size]);
-        }
-        s.heap.free(s.size);
-        const array = @ptrCast([*]u8, s.args);
-        s.heap.free(array[0..s.bytes]);
-    }
+fn mkArgv(heap: *mem.Allocator, arg: [*:0]const u8) ![*:null]?[*:0]const u8 {
+    const input = mem.trim(u8, arg[0 .. mem.len(arg)], &std.ascii.spaces);
 
-    // Returns the number of arguments in input[]
-    fn count(input: []const u8) !usize {
-        var spaces: usize = 0;
-        var in_single_quotes = false;
-        var in_double_quotes = false;
-        var previously_space = false;
-        for (input) |ch| switch (ch) {
-            ' ' => {
-                if ((!(in_single_quotes or in_double_quotes)) and (!previously_space)) {
-                    previously_space = true;
-                    spaces += 1;
-                }
-            },
-            '\'' => {
-                previously_space = false;
-                in_single_quotes = !in_single_quotes;
-            },
-            '"' => {
-                previously_space = false;
-                in_double_quotes = !in_double_quotes;
-            },
-            else => previously_space = false,
-        };
-        if (in_single_quotes or in_double_quotes) return error.QUOTATION_ERROR;
-        return spaces + 1;
-    }
+    // 'count' is the number of argv elements in 'input'
+    var count: usize = 0;
+    var in_single_quotes = false;
+    var in_double_quotes = false;
+    var previously_space = false;
+    for (input) |ch| switch (ch) {
+        ' ' => {
+            if ((!(in_single_quotes or in_double_quotes)) and (!previously_space)) {
+                previously_space = true;
+                count += 1;
+            }
+        },
+        '\'' => {
+            previously_space = false;
+            in_single_quotes = !in_single_quotes;
+        },
+        '"' => {
+            previously_space = false;
+            in_double_quotes = !in_double_quotes;
+        },
+        else => previously_space = false,
+    };
+    if (in_single_quotes or in_double_quotes) return error.QUOTATION_ERROR;
+    count += 1;
 
-    // Returns an array with the byte sizes of each argument in input[]
-    fn measure(heap: *Allocator, input: []const u8, length: usize) ![]usize {
-        var table = try heap.alloc(usize, length);
-        var in_single_quotes = false;
-        var in_double_quotes = false;
-        var previously_space = false;
-        var string: usize = 0;
-        var bytes: usize = 0;
-        for (input) |ch| switch (ch) {
-            ' ' => {
-                if (in_single_quotes or in_double_quotes) {
-                    bytes += 1;
-                } else if (!previously_space) {
-                    previously_space = true;
-                    table[string] = bytes;
-                    string += 1;
-                    bytes = 0;
-                }
-            },
-            '\'' => {
-                previously_space = false;
-                in_single_quotes = !in_single_quotes;
-            },
-            '"' => {
-                previously_space = false;
-                in_double_quotes = !in_double_quotes;
-            },
-            else => {
-                previously_space = false;
+    // 'size[]' is the byte count of each argv element in 'input'
+    var size = try heap.alloc(usize, count);
+    var size_idx: usize = 0;
+    var bytes: usize = 0;
+    in_single_quotes = false;
+    in_double_quotes = false;
+    previously_space = false;
+    for (input) |ch| switch (ch) {
+        ' ' => {
+            if (in_single_quotes or in_double_quotes) {
                 bytes += 1;
-            },
-        };
-        table[string] = bytes;
-        return table;
+            } else if (!previously_space) {
+                previously_space = true;
+                size[size_idx] = bytes;
+                size_idx += 1;
+                bytes = 0;
+            }
+        },
+        '\'' => {
+            previously_space = false;
+            in_single_quotes = !in_single_quotes;
+        },
+        '"' => {
+            previously_space = false;
+            in_double_quotes = !in_double_quotes;
+        },
+        else => {
+            previously_space = false;
+            bytes += 1;
+        },
+    };
+    size[size_idx] = bytes;
+
+    const argv = try heap.allocSentinel(?[*:0]u8, count, null);
+    for (size) |s, i| {
+        argv[i] = try heap.allocSentinel(u8, s, 0);
     }
-};
+
+    // Copy the argv elements in 'input' into 'argv[]' and return it
+    var string: usize = 0;
+    var char: usize = 0;
+    in_single_quotes = false;
+    in_double_quotes = false;
+    previously_space = false;
+    for (input) |ch| switch (ch) {
+        ' ' => {
+            if (in_single_quotes or in_double_quotes) {
+                argv[string].?[char] = ch;
+                char += 1;
+            } else if (!previously_space) {
+                previously_space = true;
+                string += 1;
+                char = 0;
+            }
+        },
+        '\'' => {
+            previously_space = false;
+            in_single_quotes = !in_single_quotes;
+        },
+        '"' => {
+            previously_space = false;
+            in_double_quotes = !in_double_quotes;
+        },
+        else => {
+            previously_space = false;
+            argv[string].?[char] = ch;
+            char += 1;
+        },
+    };
+
+    return argv;
+}
